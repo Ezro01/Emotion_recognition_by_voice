@@ -14,6 +14,12 @@ from tensorflow import keras
 from tensorflow.keras import layers
 import json
 from tqdm import tqdm
+import io
+import matplotlib
+
+matplotlib.use("Agg")  # безопасный backend для генерации графиков
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 class EmotionClassifier:
     def __init__(
@@ -31,6 +37,173 @@ class EmotionClassifier:
         self.model = None
         self.label_encoder = LabelEncoder()
         self._rng = np.random.default_rng(random_state)
+
+    def _get_model_summary(self):
+        """Возвращает текстовое представление архитектуры модели."""
+        if self.model is None:
+            return ""
+
+        buffer = io.StringIO()
+        self.model.summary(print_fn=lambda x: buffer.write(x + "\n"))
+        return buffer.getvalue()
+
+    def _plot_confusion_matrix(self, cm, labels, output_path="confusion_matrix.png"):
+        """Сохраняет матрицу ошибок в виде тепловой карты."""
+        plt.figure(figsize=(max(6, len(labels) * 0.9), max(5, len(labels) * 0.7)))
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            xticklabels=labels,
+            yticklabels=labels,
+        )
+        plt.xlabel("Предсказано")
+        plt.ylabel("Истинно")
+        plt.title("Матрица ошибок (heatmap)")
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300)
+        plt.close()
+
+    def _plot_training_curves(self, history_dict, output_path="training_curves.png"):
+        """Строит и сохраняет графики точности и функции потерь."""
+        epochs = range(1, len(history_dict["accuracy"]) + 1)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        axes[0].plot(epochs, history_dict["accuracy"], label="Train Accuracy")
+        axes[0].plot(epochs, history_dict["val_accuracy"], label="Val Accuracy")
+        axes[0].set_title("Динамика точности")
+        axes[0].set_xlabel("Эпоха")
+        axes[0].set_ylabel("Точность")
+        axes[0].legend()
+        axes[0].grid(alpha=0.3)
+
+        axes[1].plot(epochs, history_dict["loss"], label="Train Loss")
+        axes[1].plot(epochs, history_dict["val_loss"], label="Val Loss")
+        axes[1].set_title("Динамика функции потерь")
+        axes[1].set_xlabel("Эпоха")
+        axes[1].set_ylabel("Loss")
+        axes[1].legend()
+        axes[1].grid(alpha=0.3)
+
+        fig.suptitle("Графики обучения", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=300)
+        plt.close(fig)
+
+    def _build_analysis_text(self, report, final_train_acc, final_val_acc, best_val_acc, cm, labels):
+        """Формирует краткий анализ результатов."""
+        analysis_lines = []
+
+        analysis_lines.append(
+            f"Финальная точность: train {final_train_acc:.2%}, val {final_val_acc:.2%}, лучшая val {best_val_acc:.2%}."
+        )
+
+        per_class_f1 = [
+            (cls, metrics["f1-score"])
+            for cls, metrics in report.items()
+            if isinstance(metrics, dict) and "f1-score" in metrics
+        ]
+        if per_class_f1:
+            best_cls, best_f1 = max(per_class_f1, key=lambda x: x[1])
+            worst_cls, worst_f1 = min(per_class_f1, key=lambda x: x[1])
+            analysis_lines.append(f"Лучший класс по F1: {best_cls} ({best_f1:.3f}).")
+            analysis_lines.append(f"Слабейший класс по F1: {worst_cls} ({worst_f1:.3f}).")
+
+        if cm.size > 1:
+            off_diag = cm.copy()
+            np.fill_diagonal(off_diag, 0)
+            max_pos = np.unravel_index(np.argmax(off_diag), off_diag.shape)
+            if off_diag[max_pos] > 0:
+                analysis_lines.append(
+                    f"Наибольшая путаница: истинный '{labels[max_pos[0]]}' ошибочно классифицируется как '{labels[max_pos[1]]}' ({off_diag[max_pos]} раз)."
+                )
+
+        return "\n".join(f"- {line}" for line in analysis_lines)
+
+    def _save_markdown_report(
+        self,
+        model_summary,
+        final_train_acc,
+        final_val_acc,
+        best_val_acc,
+        best_train_acc,
+        history_dict,
+        classification_report_dict,
+        confusion_matrix_path,
+        curves_path,
+        analysis_text,
+        encoder_classes,
+        report_path="TRAINING_REPORT.md",
+    ):
+        """Сохраняет полный отчёт по обучению в Markdown."""
+        lines = []
+        lines.append("# Отчёт об обучении модели классификации эмоций\n")
+
+        lines.append("## Архитектура модели")
+        lines.append("```\n" + model_summary.strip() + "\n```\n")
+
+        lines.append("## Извлечение признаков")
+        lines.append(
+            "- MFCC (13 коэффициентов) + усреднение по времени\n"
+            "- Chroma STFT\n"
+            "- Mel-спектрограмма\n"
+            "- Спектральный контраст\n"
+            "- Tonnetz\n"
+            "- Все признаки усредняются по временной оси и конкатенируются"
+        )
+        lines.append(
+            "### Аугментации\n"
+            "- Добавление шума\n"
+            "- Pitch-shift\n"
+            "- Time-stretch\n"
+            "- Сдвиг по времени\n"
+            "- Изменение усиления (gain)"
+        )
+
+        lines.append("## Итоги обучения")
+        lines.append(f"- Финальная точность (train): {final_train_acc:.4f}")
+        lines.append(f"- Лучшая точность (train): {best_train_acc:.4f}")
+        lines.append(f"- Финальная точность (val): {final_val_acc:.4f}")
+        lines.append(f"- Лучшая точность (val): {best_val_acc:.4f}")
+        lines.append(f"- Финальная loss (train): {history_dict['loss'][-1]:.4f}")
+        lines.append(f"- Финальная loss (val): {history_dict['val_loss'][-1]:.4f}")
+        lines.append(f"- Минимальная loss (val): {min(history_dict['val_loss']):.4f}\n")
+
+        lines.append("## Classification report")
+        lines.append("| Класс | Precision | Recall | F1-score | Support |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for cls in encoder_classes:
+            metrics = classification_report_dict.get(cls, {})
+            lines.append(
+                f"| {cls} | {metrics.get('precision', 0):.4f} | {metrics.get('recall', 0):.4f} | "
+                f"{metrics.get('f1-score', 0):.4f} | {metrics.get('support', 0)} |"
+            )
+        lines.append(
+            f"| Macro avg | {classification_report_dict['macro avg']['precision']:.4f} | "
+            f"{classification_report_dict['macro avg']['recall']:.4f} | "
+            f"{classification_report_dict['macro avg']['f1-score']:.4f} | "
+            f"{classification_report_dict['macro avg']['support']} |"
+        )
+        lines.append(
+            f"| Weighted avg | {classification_report_dict['weighted avg']['precision']:.4f} | "
+            f"{classification_report_dict['weighted avg']['recall']:.4f} | "
+            f"{classification_report_dict['weighted avg']['f1-score']:.4f} | "
+            f"{classification_report_dict['weighted avg']['support']} |"
+        )
+        lines.append("")
+
+        lines.append("## Матрица ошибок")
+        lines.append(f"![Матрица ошибок]({confusion_matrix_path})\n")
+
+        lines.append("## Графики обучения")
+        lines.append(f"![Графики точности и loss]({curves_path})\n")
+
+        lines.append("## Анализ результатов")
+        lines.append(analysis_text + "\n")
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
 
     def _pad_or_trim(self, y):
         """Приводит аудио к фиксированной длине."""
@@ -341,6 +514,36 @@ class EmotionClassifier:
             for j in range(len(self.label_encoder.classes_)):
                 print(f"{cm[i][j]:<10}", end="")
             print()
+
+        # Визуализация метрик
+        cm_path = "confusion_matrix.png"
+        curves_path = "training_curves.png"
+        self._plot_confusion_matrix(cm, self.label_encoder.classes_, cm_path)
+        self._plot_training_curves(history.history, curves_path)
+
+        # Анализ и отчёт
+        analysis_text = self._build_analysis_text(
+            report,
+            final_train_acc,
+            final_val_acc,
+            best_val_acc,
+            cm,
+            self.label_encoder.classes_,
+        )
+        model_summary = self._get_model_summary()
+        self._save_markdown_report(
+            model_summary=model_summary,
+            final_train_acc=final_train_acc,
+            final_val_acc=final_val_acc,
+            best_val_acc=best_val_acc,
+            best_train_acc=best_train_acc,
+            history_dict=history.history,
+            classification_report_dict=report,
+            confusion_matrix_path=cm_path,
+            curves_path=curves_path,
+            analysis_text=analysis_text,
+            encoder_classes=self.label_encoder.classes_,
+        )
         
         print(f"\n{'='*80}")
         print(f"{'✅ ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО':^80}")
