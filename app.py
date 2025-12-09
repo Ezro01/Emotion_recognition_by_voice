@@ -322,6 +322,7 @@ async def read_root():
         let recording = false;
         let timerInterval;
         let seconds = 0;
+        let lastMimeType = 'audio/webm';
         
         const recordButton = document.getElementById('recordButton');
         const stopButton = document.getElementById('stopButton');
@@ -332,6 +333,53 @@ async def read_root():
         const timer = document.getElementById('timer');
         const audioPlayback = document.getElementById('audioPlayback');
         const uploadedAudio = document.getElementById('uploadedAudio');
+        
+        async function blobToWav(blob) {
+            // Преобразует записанный Blob в WAV (PCM 16-bit), чтобы плеер точно смог воспроизвести
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioCtx = new AudioContext();
+            const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+            
+            const numChannels = decoded.numberOfChannels;
+            const sampleRate = decoded.sampleRate;
+            const numFrames = decoded.length;
+            const bytesPerSample = 2;
+            const blockAlign = numChannels * bytesPerSample;
+            const wavBuffer = new ArrayBuffer(44 + numFrames * blockAlign);
+            const view = new DataView(wavBuffer);
+            
+            // Заголовок RIFF/WAVE
+            const writeString = (offset, str) => {
+                for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+            };
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + numFrames * blockAlign, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);          // Subchunk1Size
+            view.setUint16(20, 1, true);           // PCM
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * blockAlign, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, bytesPerSample * 8, true);
+            writeString(36, 'data');
+            view.setUint32(40, numFrames * blockAlign, true);
+            
+            // PCM данные
+            let offset = 44;
+            const clamp = (v) => Math.max(-1, Math.min(1, v));
+            for (let i = 0; i < numFrames; i++) {
+                for (let ch = 0; ch < numChannels; ch++) {
+                    const sample = clamp(decoded.getChannelData(ch)[i]);
+                    const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+                    view.setInt16(offset, int16, true);
+                    offset += 2;
+                }
+            }
+            
+            return new Blob([wavBuffer], { type: 'audio/wav' });
+        }
         
         function showStatus(message, type) {
             statusDiv.textContent = message;
@@ -350,7 +398,11 @@ async def read_root():
         async function startRecording() {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
+                const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                    ? 'audio/webm;codecs=opus'
+                    : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
+                mediaRecorder = preferredMime ? new MediaRecorder(stream, { mimeType: preferredMime }) : new MediaRecorder(stream);
+                lastMimeType = mediaRecorder.mimeType || preferredMime || 'audio/webm';
                 audioChunks = [];
                 
                 mediaRecorder.ondataavailable = (event) => {
@@ -358,10 +410,19 @@ async def read_root():
                 };
                 
                 mediaRecorder.onstop = async () => {
-                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    const rawBlob = new Blob(audioChunks, { type: lastMimeType });
+                    let audioBlob = rawBlob;
+                    try {
+                        audioBlob = await blobToWav(rawBlob);
+                    } catch (err) {
+                        console.warn('Не удалось сконвертировать в WAV, используем исходный формат', err);
+                    }
                     const audioUrl = URL.createObjectURL(audioBlob);
                     audioPlayback.src = audioUrl;
+                    audioPlayback.type = audioBlob.type || lastMimeType;
                     audioPlayback.style.display = 'block';
+                    audioPlayback.load();
+                    audioPlayback.play().catch(() => {});
                     
                     await sendAudio(audioBlob);
                 };
@@ -465,7 +526,9 @@ async def read_root():
         
         async function sendAudio(audioBlob) {
             const formData = new FormData();
-            formData.append('file', audioBlob, 'recording.wav');
+            const mime = audioBlob.type || lastMimeType || 'audio/wav';
+            const ext = mime.includes('wav') ? 'wav' : (mime.includes('ogg') ? 'ogg' : 'webm');
+            formData.append('file', audioBlob, `recording.${ext}`);
             
             showStatus('Обработка записи...', 'info');
             
@@ -559,15 +622,36 @@ async def predict_emotion(file: UploadFile = File(...)):
         with open(temp_path, "wb") as f:
             content = await file.read()
             f.write(content)
-        
-        # Предсказание
-        result = classifier.predict(temp_path)
-        
-        if result is None:
-            raise HTTPException(status_code=400, detail="Не удалось обработать аудио файл")
-        
-        return JSONResponse(content=result)
-    
+
+        # Универсальное чтение аудио (wav/webm/ogg) через librosa
+        try:
+            y, sr = librosa.load(temp_path, sr=classifier.sample_rate, duration=classifier.duration)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Не удалось прочитать аудио: {e}")
+
+        features = classifier._extract_features_from_waveform(y, sr)
+        if features is None:
+            raise HTTPException(status_code=400, detail="Не удалось извлечь признаки из аудио")
+
+        features = features.reshape(1, -1)
+        prediction = classifier.model.predict(features, verbose=0)
+        predicted_class_idx = int(np.argmax(prediction[0]))
+        predicted_emotion = classifier.label_encoder.classes_[predicted_class_idx]
+        confidence = float(prediction[0][predicted_class_idx])
+        probabilities = {
+            emotion: float(prob) for emotion, prob in zip(classifier.label_encoder.classes_, prediction[0])
+        }
+
+        return JSONResponse(
+            content={
+                "emotion": predicted_emotion,
+                "confidence": confidence,
+                "probabilities": probabilities,
+            }
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка при обработке: {str(e)}")
     
