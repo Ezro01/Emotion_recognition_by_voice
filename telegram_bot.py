@@ -80,7 +80,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Перевод эмоций на русский
         emotion_map = {
             "anger": "злость",
-            "disgust": "отвращение",
+            "disgust": "грусть",
             "enthusiasm": "энтузиазм",
             "fear": "страх",
             "happiness": "радость",
